@@ -2,14 +2,68 @@
 
 namespace App\Services;
 
-use App\Models\Person;
+use Illuminate\Support\Facades\DB;
 
 class FaceMatcher
 {
-    /** @return array{0: ?Person, 1: float} */
+    /**
+     * 1:1 — শুধু একজন নির্দিষ্ট staff-এর সাথে তুলনা
+     *
+     * @return array{0: bool, 1: ?float, 2: ?array}
+     *         [verified, distance, staffRow]
+     */
+    public function compareToStaff(string $staffId, array $descriptor, ?float $threshold = null): array
+    {
+        if (count($descriptor) !== 128 || ! $this->isFinite($descriptor)) {
+            return [false, null, null];
+        }
+
+        $threshold ??= (float) config('services.face_recognition.threshold', 0.5);
+
+        $row = DB::table('tm_aemp')
+            ->select(['aemp_id', 'aemp_name', 'aemp_usnm', 'aemp_dcpt'])
+            ->where('aemp_usnm', $staffId)
+            ->first();
+
+        if ($row === null) {
+            return [false, null, null];   // staff নেই
+        }
+
+        $stored = $this->decodeDescriptor($row->aemp_dcpt);
+        if ($stored === null) {
+            return [false, null, [
+                'staff_id'       => $row->aemp_usnm,
+                'name'           => $row->aemp_name,
+                'has_descriptor' => false,
+            ]];
+        }
+
+        $sum = 0.0;
+        for ($i = 0; $i < 128; $i++) {
+            $diff = $stored[$i] - $descriptor[$i];
+            $sum += $diff * $diff;
+        }
+        $distance = sqrt($sum);
+
+        return [
+            $distance <= $threshold,
+            $distance,
+            [
+                'staff_id'       => $row->aemp_usnm,
+                'name'           => $row->aemp_name,
+                'has_descriptor' => true,
+            ],
+        ];
+    }
+
+    /**
+     * 1:N — সবাইকে খুঁজে সবচেয়ে কাছের জন (আগেরটা, রাখো)
+     *
+     * @return array{0: ?array, 1: float}
+     */
     public function findClosest(array $descriptor, ?float $threshold = null): array
     {
-        if (count($descriptor) !== 128 || ! $this->isFiniteDescriptor($descriptor)) {
+        if (count($descriptor) !== 128 || ! $this->isFinite($descriptor)) {
             return [null, INF];
         }
 
@@ -17,26 +71,29 @@ class FaceMatcher
         $best         = null;
         $bestDistance = INF;
 
-        Person::query()
-            ->select(['id', 'name', 'email', 'photo', 'descriptor'])
-            ->each(function (Person $person) use ($descriptor, &$best, &$bestDistance) {
-                if (
-                    ! is_array($person->descriptor)
-                    || count($person->descriptor) !== 128
-                    || ! $this->isFiniteDescriptor($person->descriptor)
-                ) {
-                    return;
-                }
+        DB::table('tm_aemp')
+            ->select(['aemp_id', 'aemp_name', 'aemp_usnm', 'aemp_dcpt'])
+            ->whereNotNull('aemp_dcpt')
+            ->orderBy('aemp_id')
+            ->lazyById(1000, 'aemp_id')
+            ->each(function ($row) use ($descriptor, &$best, &$bestDistance) {
+                $stored = $this->decodeDescriptor($row->aemp_dcpt);
+                if ($stored === null) return;
 
-                $distance = sqrt(array_sum(array_map(
-                    fn (float|int $stored, float|int $incoming): float => ($stored - $incoming) ** 2,
-                    $person->descriptor,
-                    $descriptor,
-                )));
+                $sum = 0.0;
+                for ($i = 0; $i < 128; $i++) {
+                    $diff = $stored[$i] - $descriptor[$i];
+                    $sum += $diff * $diff;
+                }
+                $distance = sqrt($sum);
 
                 if ($distance < $bestDistance) {
                     $bestDistance = $distance;
-                    $best         = $person;
+                    $best = [
+                        'staff_id' => $row->aemp_usnm,
+                        'name'     => $row->aemp_name,
+                        'aemp_id'  => $row->aemp_id,
+                    ];
                 }
             });
 
@@ -47,18 +104,30 @@ class FaceMatcher
         return [$best, $bestDistance];
     }
 
-    private function isFiniteDescriptor(array $descriptor): bool
+    /** @return list<float>|null */
+    private function decodeDescriptor($raw): ?array
     {
-        foreach ($descriptor as $value) {
-            if (! is_float($value) && ! is_int($value)) {
-                return false;
-            }
+        if ($raw === null || $raw === '') return null;
 
-            if (! is_finite((float) $value)) {
-                return false;
-            }
+        $arr = is_string($raw) ? json_decode($raw, true) : $raw;
+        if (! is_array($arr) || count($arr) !== 128) return null;
+
+        $out = [];
+        foreach ($arr as $v) {
+            if (! is_float($v) && ! is_int($v)) return null;
+            $f = (float) $v;
+            if (! is_finite($f)) return null;
+            $out[] = $f;
         }
+        return $out;
+    }
 
+    private function isFinite(array $d): bool
+    {
+        foreach ($d as $v) {
+            if (! is_float($v) && ! is_int($v)) return false;
+            if (! is_finite((float) $v)) return false;
+        }
         return true;
     }
 }

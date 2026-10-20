@@ -3,14 +3,11 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Person;
 use App\Services\FaceDetectionService;
 use App\Services\FaceMatcher;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
-use Illuminate\Support\Str;
 use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
@@ -22,72 +19,89 @@ class FaceApiController extends Controller
         private FaceMatcher $matcher,
     ) {}
 
-    public function recognize(Request $request): JsonResponse
-    {
-        $data = $request->validate([
-            'image' => ['required', 'string', 'max:10485760'],
-        ]);
+    /**
+     * POST /api/v1/recognize
+     * Body: { image: "data:image/jpeg;base64,..." }
+     */
+   public function recognize(Request $request): JsonResponse
+{
+    $data = $request->validate([
+        'staff_id' => ['required', 'string', 'max:255'],
+        'image'    => ['required', 'string', 'max:10485760'],
+    ]);
 
-        try {
-            $detection = $this->detector->detectFromBase64($data['image']);
-        } catch (InvalidArgumentException $e) {
-            return response()->json(['error' => $e->getMessage()], 422);
-        } catch (RuntimeException $e) {
-            return response()->json(['error' => $e->getMessage()], 503);
-        }
+    try {
+        $detection = $this->detector->detectFromBase64($data['image']);
+    } catch (InvalidArgumentException $e) {
+        return response()->json(['error' => $e->getMessage()], 422);
+    } catch (RuntimeException $e) {
+        return response()->json(['error' => $e->getMessage()], 503);
+    }
 
-        if (! ($detection['detected'] ?? false)) {
-            return response()->json(['matched' => false, 'person' => null, 'reason' => 'no_face']);
-        }
-
-        try {
-            $descriptor = $this->descriptorFromDetection($detection);
-        } catch (InvalidArgumentException $e) {
-            return response()->json(['error' => $e->getMessage()], 422);
-        }
-
-        $threshold = (float) config('services.face_recognition.threshold', 0.5);
-
-        [$person, $distance] = $this->matcher->findClosest($descriptor, $threshold);
-
-        if ($person === null) {
-            return response()->json([
-                'matched'   => false,
-                'person'    => null,
-                'distance'  => is_finite($distance) ? $distance : null,
-                'threshold' => $threshold,
-            ]);
-        }
-
+    if (! ($detection['detected'] ?? false)) {
         return response()->json([
-            'matched' => true,
-            'person'  => [
-                'id'    => $person->id,
-                'name'  => $person->name,
-                'email' => $person->email,
-                'photo' => $person->photo ? Storage::disk('public')->url($person->photo) : null,
-            ],
-            'distance'  => $distance,
-            'threshold' => $threshold,
+            'verified' => false,
+            'reason'   => 'no_face',
         ]);
     }
 
-    public function index(): JsonResponse
-    {
-        return response()->json(Person::latest()->paginate(20));
+    try {
+        $descriptor = $this->descriptorFromDetection($detection);
+    } catch (InvalidArgumentException $e) {
+        return response()->json(['error' => $e->getMessage()], 422);
     }
 
-    public function store(Request $request): JsonResponse
+    $threshold = (float) config('services.face_recognition.threshold', 0.5);
+
+    [$verified, $distance, $staff] = $this->matcher->compareToStaff(
+        $data['staff_id'],
+        $descriptor,
+        $threshold,
+    );
+
+    // staff নেই
+    if ($staff === null) {
+        return response()->json(['error' => 'Staff not found'], 404);
+    }
+
+    // staff আছে কিন্তু enrollment হয়নি
+    if (! $staff['has_descriptor']) {
+        return response()->json([
+            'verified' => false,
+            'staff_id' => $staff['staff_id'],
+            'name'     => $staff['name'],
+            'reason'   => 'not_enrolled',
+        ], 409);
+    }
+
+    return response()->json([
+        'verified'  => $verified,
+        'staff_id'  => $staff['staff_id'],
+        'name'      => $staff['name'],
+        'distance'  => $distance,
+        'threshold' => $threshold,
+    ]);
+}
+
+    /**
+     * POST /api/v1/people/enroll
+     * Body: { staff_id: "EMP001", image: "data:image/jpeg;base64,..." }
+     * tm_aemp-এ aemp_dcpt আপডেট করে
+     */
+    public function enroll(Request $request): JsonResponse
     {
         $data = $request->validate([
-            'name'  => ['required', 'string', 'max:255'],
-            'email' => ['nullable', 'email', 'max:255'],
-            'image' => ['required', 'string', 'max:10485760'],
+            'staff_id' => ['required', 'string', 'max:255'],
+            'image'    => ['required', 'string', 'max:10485760'],
         ]);
+
+        $exists = DB::table('tm_aemp')->where('aemp_usnm', $data['staff_id'])->exists();
+        if (! $exists) {
+            return response()->json(['error' => 'Staff not found'], 404);
+        }
 
         try {
             $detection = $this->detector->detectFromBase64($data['image']);
-            $image     = $this->detector->decodeBase64Image($data['image']);
         } catch (InvalidArgumentException $e) {
             return response()->json(['error' => $e->getMessage()], 422);
         } catch (RuntimeException $e) {
@@ -104,57 +118,94 @@ class FaceApiController extends Controller
             return response()->json(['error' => $e->getMessage()], 422);
         }
 
-        $filename = 'people/'.Str::uuid().'.jpg';
-        if (! Storage::disk('public')->put($filename, $image)) {
-            return response()->json(['error' => 'Unable to store image'], 503);
+        try {
+            DB::table('tm_aemp')
+                ->where('aemp_usnm', $data['staff_id'])
+                ->update([
+                    'aemp_dcpt' => json_encode($descriptor),
+                ]);
+        } catch (Throwable $e) {
+            return response()->json(['error' => 'Failed to save descriptor'], 500);
         }
 
-        try {
-            $person = DB::transaction(fn () => Person::create([
-                'name'       => $data['name'],
-                'email'      => $data['email'] ?? null,
-                'photo'      => $filename,
-                'descriptor' => $descriptor,
-            ]));
-        } catch (Throwable $e) {
-            Storage::disk('public')->delete($filename);
-            throw $e;
-        }
+        $row = DB::table('tm_aemp')
+            ->select(['aemp_usnm', 'aemp_name'])
+            ->where('aemp_usnm', $data['staff_id'])
+            ->first();
 
         return response()->json([
-            'id'    => $person->id,
-            'name'  => $person->name,
-            'email' => $person->email,
-            'photo' => Storage::disk('public')->url($filename),
-        ], 201);
+            'updated'  => true,
+            'staff_id' => $row->aemp_usnm,
+            'name'     => $row->aemp_name,
+        ]);
     }
 
-    public function destroy(Person $person): JsonResponse
+    /**
+     * GET /api/v1/people?q=...&page=1
+     */
+    public function index(Request $request): JsonResponse
     {
-        if ($person->photo) {
-            Storage::disk('public')->delete($person->photo);
+        $query = DB::table('tm_aemp')
+            ->select(['aemp_id', 'aemp_name', 'aemp_usnm', 'aemp_dcpt']);
+
+        if ($search = $request->query('q')) {
+            $query->where(function ($w) use ($search) {
+                $w->where('aemp_name', 'like', "%{$search}%")
+                  ->orWhere('aemp_usnm', 'like', "%{$search}%");
+            });
         }
 
-        $person->delete();
+        $paginator = $query->orderBy('aemp_id')->paginate(20);
 
-        return response()->json(['deleted' => true]);
+        // descriptor বাদ দিয়ে শুধু আছে/নেই জানাও
+        $paginator->getCollection()->transform(function ($row) {
+            $hasDescriptor = false;
+
+            if (is_string($row->aemp_dcpt) && $row->aemp_dcpt !== '') {
+                $decoded = json_decode($row->aemp_dcpt, true);
+                $hasDescriptor = is_array($decoded) && count($decoded) === 128;
+            }
+
+            return [
+                'staff_id'       => $row->aemp_usnm,
+                'name'           => $row->aemp_name,
+                'has_descriptor' => $hasDescriptor,
+            ];
+        });
+
+        return response()->json($paginator);
+    }
+
+    /**
+     * DELETE /api/v1/people/{staffId}/descriptor
+     */
+    public function clearDescriptor(string $staffId): JsonResponse
+    {
+        $exists = DB::table('tm_aemp')->where('aemp_usnm', $staffId)->exists();
+        if (! $exists) {
+            return response()->json(['error' => 'Staff not found'], 404);
+        }
+
+        DB::table('tm_aemp')
+            ->where('aemp_usnm', $staffId)
+            ->update(['aemp_dcpt' => null]);
+
+        return response()->json(['cleared' => true, 'staff_id' => $staffId]);
     }
 
     /** @return list<float> */
     private function descriptorFromDetection(array $detection): array
     {
-        $descriptor = $detection['descriptor'] ?? null;
-        if (! is_array($descriptor) || count($descriptor) !== 128) {
-            throw new InvalidArgumentException('Face detection returned an invalid descriptor');
+        $d = $detection['descriptor'] ?? null;
+        if (! is_array($d) || count($d) !== 128) {
+            throw new InvalidArgumentException('Invalid descriptor from detector');
         }
-
-        $descriptor = array_map('floatval', $descriptor);
-        foreach ($descriptor as $value) {
-            if (! is_finite($value)) {
-                throw new InvalidArgumentException('Face detection returned an invalid descriptor');
+        $d = array_map('floatval', $d);
+        foreach ($d as $v) {
+            if (! is_finite($v)) {
+                throw new InvalidArgumentException('Invalid descriptor from detector');
             }
         }
-
-        return $descriptor;
+        return $d;
     }
 }
