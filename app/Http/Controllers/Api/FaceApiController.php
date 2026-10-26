@@ -17,71 +17,72 @@ class FaceApiController extends Controller
     public function __construct(
         private FaceDetectionService $detector,
         private FaceMatcher $matcher,
-    ) {}
+    ) {
+    }
 
     /**
      * POST /api/v1/recognize
      * Body: { image: "data:image/jpeg;base64,..." }
      */
-   public function recognize(Request $request): JsonResponse
-{
-    $data = $request->validate([
-        'staff_id' => ['required', 'string', 'max:255'],
-        'image'    => ['required', 'string', 'max:10485760'],
-    ]);
+    public function recognize(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'staff_id' => ['required', 'string', 'max:255'],
+            'image' => ['required', 'string', 'max:10485760'],
+        ]);
 
-    try {
-        $detection = $this->detector->detectFromBase64($data['image']);
-    } catch (InvalidArgumentException $e) {
-        return response()->json(['error' => $e->getMessage()], 422);
-    } catch (RuntimeException $e) {
-        return response()->json(['error' => $e->getMessage()], 503);
-    }
+        try {
+            $detection = $this->detector->detectFromBase64($data['image']);
+        } catch (InvalidArgumentException $e) {
+            return response()->json(['error' => $e->getMessage()], 422);
+        } catch (RuntimeException $e) {
+            return response()->json(['error' => $e->getMessage()], 503);
+        }
 
-    if (! ($detection['detected'] ?? false)) {
+        if (!($detection['detected'] ?? false)) {
+            return response()->json([
+                'verified' => false,
+                'reason' => 'no_face',
+            ]);
+        }
+
+        try {
+            $descriptor = $this->descriptorFromDetection($detection);
+        } catch (InvalidArgumentException $e) {
+            return response()->json(['error' => $e->getMessage()], 422);
+        }
+
+        $threshold = (float) config('services.face_recognition.threshold', 0.5);
+
+        [$verified, $distance, $staff] = $this->matcher->compareToStaff($data['staff_id'], $descriptor, $threshold);
+
+        if ($staff === null) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Staff not found',
+            ], 404);
+        }
+
+        // staff আছে কিন্তু enrollment হয়নি
+        if (!$staff['has_descriptor']) {
+            return response()->json([
+                'success' => false,
+                'staff_id' => $staff['staff_id'],
+                'name' => $staff['name'],
+                'message' => 'Staff has no enrolled face descriptor',
+            ], 409);
+        }
+
         return response()->json([
-            'verified' => false,
-            'reason'   => 'no_face',
+            'success' => true,
+            'verified' => $verified,
+            'staff_id' => $staff['staff_id'],
+            'name' => $staff['name'],
+            // 'distance'  => $distance,
+            // 'threshold' => $threshold,
+            'message' => $verified ? 'Face verified successfully' : 'Face not verified',
         ]);
     }
-
-    try {
-        $descriptor = $this->descriptorFromDetection($detection);
-    } catch (InvalidArgumentException $e) {
-        return response()->json(['error' => $e->getMessage()], 422);
-    }
-
-    $threshold = (float) config('services.face_recognition.threshold', 0.5);
-
-    [$verified, $distance, $staff] = $this->matcher->compareToStaff(
-        $data['staff_id'],
-        $descriptor,
-        $threshold,
-    );
-
-    // staff নেই
-    if ($staff === null) {
-        return response()->json(['error' => 'Staff not found'], 404);
-    }
-
-    // staff আছে কিন্তু enrollment হয়নি
-    if (! $staff['has_descriptor']) {
-        return response()->json([
-            'verified' => false,
-            'staff_id' => $staff['staff_id'],
-            'name'     => $staff['name'],
-            'reason'   => 'not_enrolled',
-        ], 409);
-    }
-
-    return response()->json([
-        'verified'  => $verified,
-        'staff_id'  => $staff['staff_id'],
-        'name'      => $staff['name'],
-        'distance'  => $distance,
-        'threshold' => $threshold,
-    ]);
-}
 
     /**
      * POST /api/v1/people/enroll
@@ -92,30 +93,60 @@ class FaceApiController extends Controller
     {
         $data = $request->validate([
             'staff_id' => ['required', 'string', 'max:255'],
-            'image'    => ['required', 'string', 'max:10485760'],
+            'image' => ['required', 'string', 'max:10485760'],
         ]);
 
         $exists = DB::table('tm_aemp')->where('aemp_usnm', $data['staff_id'])->exists();
-        if (! $exists) {
-            return response()->json(['error' => 'Staff not found'], 404);
+        if (!$exists) {
+            return response()->json(
+                [
+                    'success' => false,
+                    'message' => 'Staff not found',
+                ],
+                404
+            );
         }
 
         try {
             $detection = $this->detector->detectFromBase64($data['image']);
         } catch (InvalidArgumentException $e) {
-            return response()->json(['error' => $e->getMessage()], 422);
+            return response()->json(
+                [
+                    'success' => false,
+                    'message' => $e->getMessage(),
+                ],
+                422
+            );
         } catch (RuntimeException $e) {
-            return response()->json(['error' => $e->getMessage()], 503);
+            return response()->json(
+                [
+                    'success' => false,
+                    'message' => $e->getMessage(),
+                ],
+                503
+            );
         }
 
-        if (! ($detection['detected'] ?? false)) {
-            return response()->json(['error' => 'No face detected in image'], 422);
+        if (!($detection['detected'] ?? false)) {
+            return response()->json(
+                [
+                    'success' => false,
+                    'message' => 'No face detected in the image',
+                ],
+                422
+            );
         }
 
         try {
             $descriptor = $this->descriptorFromDetection($detection);
         } catch (InvalidArgumentException $e) {
-            return response()->json(['error' => $e->getMessage()], 422);
+            return response()->json(
+                [
+                    'success' => false,
+                    'message' => $e->getMessage(),
+                ],
+                422
+            );
         }
 
         try {
@@ -134,9 +165,10 @@ class FaceApiController extends Controller
             ->first();
 
         return response()->json([
-            'updated'  => true,
+            'success' => true,
             'staff_id' => $row->aemp_usnm,
-            'name'     => $row->aemp_name,
+            'name' => $row->aemp_name,
+            'message' => 'Face descriptor regiser successfully',
         ]);
     }
 
@@ -151,7 +183,7 @@ class FaceApiController extends Controller
         if ($search = $request->query('q')) {
             $query->where(function ($w) use ($search) {
                 $w->where('aemp_name', 'like', "%{$search}%")
-                  ->orWhere('aemp_usnm', 'like', "%{$search}%");
+                    ->orWhere('aemp_usnm', 'like', "%{$search}%");
             });
         }
 
@@ -167,8 +199,8 @@ class FaceApiController extends Controller
             }
 
             return [
-                'staff_id'       => $row->aemp_usnm,
-                'name'           => $row->aemp_name,
+                'staff_id' => $row->aemp_usnm,
+                'name' => $row->aemp_name,
                 'has_descriptor' => $hasDescriptor,
             ];
         });
@@ -182,7 +214,7 @@ class FaceApiController extends Controller
     public function clearDescriptor(string $staffId): JsonResponse
     {
         $exists = DB::table('tm_aemp')->where('aemp_usnm', $staffId)->exists();
-        if (! $exists) {
+        if (!$exists) {
             return response()->json(['error' => 'Staff not found'], 404);
         }
 
@@ -197,12 +229,12 @@ class FaceApiController extends Controller
     private function descriptorFromDetection(array $detection): array
     {
         $d = $detection['descriptor'] ?? null;
-        if (! is_array($d) || count($d) !== 128) {
+        if (!is_array($d) || count($d) !== 128) {
             throw new InvalidArgumentException('Invalid descriptor from detector');
         }
         $d = array_map('floatval', $d);
         foreach ($d as $v) {
-            if (! is_finite($v)) {
+            if (!is_finite($v)) {
                 throw new InvalidArgumentException('Invalid descriptor from detector');
             }
         }

@@ -21,12 +21,12 @@ class FaceMatcher
         $threshold ??= (float) config('services.face_recognition.threshold', 0.5);
 
         $row = DB::table('tm_aemp')
-            ->select(['aemp_id', 'aemp_name', 'aemp_usnm', 'aemp_dcpt'])
+            ->select(['id', 'aemp_name', 'aemp_usnm', 'aemp_dcpt'])
             ->where('aemp_usnm', $staffId)
             ->first();
 
         if ($row === null) {
-            return [false, null, null];   // staff নেই
+            return [false, null, null];   
         }
 
         $stored = $this->decodeDescriptor($row->aemp_dcpt);
